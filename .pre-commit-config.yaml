@@ -1,0 +1,20 @@
+# See https://pre-commit.com for more information
+# Configuração única do monorepo: vale para todos os serviços em services/.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v3.2.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1          # DEVE coincidir com o `ruff` do pyproject.toml / uv.lock dos serviços
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+        exclude: ^.*/tests/
+      - id: ruff-format
+        exclude: ^.*/tests/
