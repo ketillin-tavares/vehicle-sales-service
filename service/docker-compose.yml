@@ -34,6 +34,20 @@ services:
     networks:
       - vehicle-sales-network
 
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: vehicle-sales-seed
+    env_file: [.env]
+    command: ["python", "scripts/seed.py"]
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    networks:
+      - vehicle-sales-network
+
   vehicle-sales-service:
     build:
       context: .

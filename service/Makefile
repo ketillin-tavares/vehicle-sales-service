@@ -11,7 +11,7 @@ test-cov:
 	uv run pytest --cov=src --cov-report=term-missing -m "not integration"
 
 pre-commit:
-	uv run pre-commit run --all-files --config ../../.pre-commit-config.yaml
+	uv run pre-commit run --all-files --config ../.pre-commit-config.yaml
 
 quality:
 	uv run ruff format src/ tests/
