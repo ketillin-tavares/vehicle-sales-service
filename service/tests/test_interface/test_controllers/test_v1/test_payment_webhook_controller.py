@@ -86,6 +86,19 @@ class TestPaymentWebhookRoute:
         assert response.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_non_ascii_token_returns_401(self, async_client: AsyncClient) -> None:
+        """Test that a non-ASCII X-Webhook-Token header returns a clean 401 instead of a 500."""
+        # Act
+        response = await async_client.post(
+            "/webhooks/v1/payments",
+            json={"payment_code": "pay-1", "status": "paid"},
+            headers={"X-Webhook-Token": "ç".encode("latin-1")},
+        )
+
+        # Assert
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_unknown_payment_code_returns_404(
         self, async_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
