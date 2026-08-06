@@ -104,3 +104,19 @@ class TestUpsertVehicleReplicaRoute:
 
         # Assert
         assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_token_returns_401(self, async_client: AsyncClient) -> None:
+        """Test that a snapshot request with a non-ASCII X-Internal-Token returns a clean 401 instead of a 500."""
+        # Arrange
+        vehicle_id = uuid.uuid4()
+
+        # Act
+        response = await async_client.put(
+            f"/internal/v1/vehicles/{vehicle_id}",
+            json={"brand": "Fiat", "model": "Mobi", "year": 2022, "color": "Branco", "price": "60000.00", "version": 1},
+            headers={"X-Internal-Token": "ç".encode("latin-1")},
+        )
+
+        # Assert
+        assert response.status_code == 401

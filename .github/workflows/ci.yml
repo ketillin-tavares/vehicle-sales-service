@@ -1,0 +1,86 @@
+# CI — quality gate on every pull request (mirrors `make quality` in service/).
+# Security (plan items 8/10): plain pull_request (never pull_request_target),
+# least-privilege permissions, every action pinned by full commit SHA.
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: service
+    env:
+      # Exposed at job level so the SonarCloud steps can be conditionally
+      # skipped (`if: env.SONAR_TOKEN != ''`) — secrets are not addressable
+      # directly in `if:` expressions.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: SonarCloud needs blame data and the merge base for
+          # accurate PR analysis (shallow clones degrade new-code detection).
+          fetch-depth: 0
+
+      - name: Set up uv (installs Python 3.13 per pyproject)
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: service/uv.lock
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Ruff format check
+        run: uv run ruff format --check src/ tests/
+
+      - name: Ruff lint
+        run: uv run ruff check src/ tests/
+
+      - name: Type check (ty)
+        run: uv run ty check src/
+
+      - name: Unit tests with coverage
+        run: uv run pytest --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -m "not integration"
+
+      - name: Integration tests (testcontainers)
+        run: uv run pytest -m integration
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml
+          path: service/coverage.xml
+
+      # PR analysis + decoration on SonarCloud. Skipped gracefully until the
+      # repo is onboarded (SONAR_TOKEN secret configured); projectKey and
+      # organization come from repo variables so sonar-project.properties
+      # stays generic.
+      - name: SonarCloud scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        with:
+          projectBaseDir: service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Docker build smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: service
+          push: false

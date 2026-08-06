@@ -1,3 +1,4 @@
+import os
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import date
@@ -7,10 +8,17 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.application.ports import CoreNotifier
-from src.domain.entities import Sale, VehicleReplica
-from src.domain.repositories import SaleRepository, VehicleReplicaRepository
-from src.main import app
+# DATABASE_PASSWORD, INTERNAL_API_TOKEN e PAYMENT_WEBHOOK_TOKEN são obrigatórios em
+# src.environment.Settings; precisam estar definidos antes de qualquer import de src.main,
+# que resolve as settings em tempo de import.
+os.environ.setdefault("DATABASE_PASSWORD", "vehicle_sales_pass")
+os.environ.setdefault("INTERNAL_API_TOKEN", "internal-token")
+os.environ.setdefault("PAYMENT_WEBHOOK_TOKEN", "webhook-token")
+
+from src.application.ports import CoreNotifier  # noqa: E402
+from src.domain.entities import Sale, VehicleReplica  # noqa: E402
+from src.domain.repositories import SaleRepository, VehicleReplicaRepository  # noqa: E402
+from src.main import app  # noqa: E402
 
 VALID_CPF = "52998224725"
 OTHER_VALID_CPF = "11144477735"
