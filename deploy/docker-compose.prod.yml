@@ -1,0 +1,77 @@
+# Production compose for the EC2 instance — SELF-CONTAINED on purpose:
+# the instance has no repo checkout, so services run from a pre-built image
+# (APP_IMAGE, e.g. <account>.dkr.ecr.<region>.amazonaws.com/vehicle-sales-service:<sha>)
+# instead of the `build:` contexts used by service/docker-compose.yml for
+# local dev.
+#
+# Differences from local dev (by design):
+# - NO postgres service — the database is RDS (DATABASE_* in .env points
+#   at it; security item 3 is moot: nothing listens on 5432 on the host).
+# - NO seed service — seed is local-dev-only, it NEVER runs in production.
+# - NO `vehicle-platform` external network — this service and
+#   vehicle-core-service run on SEPARATE EC2 instances, so a shared bridge
+#   network cannot carry traffic between them and container-name resolution
+#   across hosts does NOT work. Cross-service calls go over the public
+#   endpoint configured in CORE_SERVICE_BASE_URL.
+#
+# Non-secret config comes from /opt/vehicle-sales-service/.env materialized by
+# deploy.sh from SSM Parameter Store, plus APP_IMAGE exported by deploy.sh.
+# The three secrets (DATABASE_PASSWORD, INTERNAL_API_TOKEN,
+# PAYMENT_WEBHOOK_TOKEN) are NOT in .env — they are passed through from
+# deploy.sh's environment, see `environment:`.
+name: vehicle-sales
+
+services:
+  migrations:
+    image: ${APP_IMAGE}
+    container_name: vehicle-sales-migrations
+    env_file: [.env]
+    # Pass-through (valueless) form: the value is copied VERBATIM from the
+    # deploy.sh shell environment. These three are NOT in .env on purpose —
+    # Compose interpolates env_file values, so a `$` or `{` in the
+    # RDS-generated password would be silently truncated or fail the whole
+    # deploy with `Invalid template`.
+    # INTERNAL_API_TOKEN and PAYMENT_WEBHOOK_TOKEN are required HERE even
+    # though alembic never uses them: alembic/env.py calls get_settings() at
+    # import time to build sqlalchemy.url, which constructs the whole Settings
+    # object, and both tokens are required fields with no default. Without
+    # them the container dies with a pydantic ValidationError before it ever
+    # reaches the database.
+    environment:
+      - DATABASE_PASSWORD
+      - INTERNAL_API_TOKEN
+      - PAYMENT_WEBHOOK_TOKEN
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - vehicle-sales-network
+
+  vehicle-sales-service:
+    image: ${APP_IMAGE}
+    container_name: vehicle-sales-service
+    env_file: [.env]
+    # Pass-through secrets — see the comment on `migrations` above.
+    environment:
+      - DATABASE_PASSWORD
+      - INTERNAL_API_TOKEN
+      - PAYMENT_WEBHOOK_TOKEN
+    # Survive an EC2 reboot / daemon restart without waiting for a redeploy.
+    # NOT set on `migrations`: that is a run-once job and any restart policy
+    # would make it loop forever.
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - vehicle-sales-network
+
+networks:
+  vehicle-sales-network:
+    driver: bridge
