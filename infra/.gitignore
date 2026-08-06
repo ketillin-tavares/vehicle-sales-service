@@ -1,0 +1,7 @@
+# Terraform local artifacts (Floci validation and local init runs)
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/crash.log

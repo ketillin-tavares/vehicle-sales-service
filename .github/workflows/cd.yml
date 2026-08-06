@@ -1,0 +1,228 @@
+# CD — merge to main (or manual): quality gate -> build & push to ECR -> deploy
+# to the EC2 instance via SSM Run Command. The deploy job ships the repo's
+# deploy/deploy.sh and deploy/docker-compose.prod.yml to the instance
+# (base64 over the same SSM channel — the repo is the single source of truth;
+# user_data only preps docker + /opt/vehicle-sales-service) and then runs
+# /opt/vehicle-sales-service/deploy.sh <image-ref>.
+# Security (plan items 5/6/8): OIDC only (no static AWS keys), id-token: write
+# scoped to the jobs that assume the role, every action pinned by commit SHA,
+# no secrets in SendCommand parameters or logs.
+name: CD
+
+on:
+  push:
+    branches: [main]
+    # Allowlist: everything the app pipeline builds/ships lives under
+    # service/ (image context) and deploy/ (deploy.sh + compose shipped at
+    # deploy time), plus this workflow itself. Infra-only or docs-only merges
+    # don't trigger a deploy. Caveat: if this workflow ever becomes a required
+    # branch-protection check, path filtering leaves non-matching PRs pending
+    # forever — keep it out of required checks (CI covers PRs).
+    paths:
+      - "service/**"
+      - "deploy/**"
+      - ".github/workflows/cd.yml"
+  # Manual runs are always unconditional (full pipeline regardless of paths).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time; queued runs wait instead of cancelling an in-flight deploy.
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+env:
+  ECR_REPOSITORY: vehicle-sales-service
+
+jobs:
+  quality-gate:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: service
+    env:
+      # Exposed at job level so the SonarCloud step can be conditionally
+      # skipped (`if: env.SONAR_TOKEN != ''`) — secrets are not addressable
+      # directly in `if:` expressions.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: SonarCloud needs blame data for accurate main-branch
+          # analysis (the baseline for PR analyses).
+          fetch-depth: 0
+
+      - name: Set up uv (installs Python 3.13 per pyproject)
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: service/uv.lock
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Ruff format check
+        run: uv run ruff format --check src/ tests/
+
+      - name: Ruff lint
+        run: uv run ruff check src/ tests/
+
+      - name: Type check (ty)
+        run: uv run ty check src/
+
+      - name: Unit tests with coverage
+        run: uv run pytest --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -m "not integration"
+
+      - name: Integration tests (testcontainers)
+        run: uv run pytest -m integration
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml
+          path: service/coverage.xml
+
+      # Main-branch analysis on SonarCloud (the baseline PR analyses compare
+      # against). `sonar.qualitygate.wait=true` makes the scanner poll the
+      # Quality Gate result and fail this job when the gate fails, which
+      # blocks build-push -> deploy. Skipped gracefully until the repo is
+      # onboarded (SONAR_TOKEN secret configured).
+      - name: SonarCloud scan (blocks deploy on failed Quality Gate)
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        with:
+          projectBaseDir: service
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.qualitygate.wait=true
+
+  build-push:
+    name: Build and push image to ECR
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: service
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy to EC2 via SSM
+    needs: build-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ship deploy artifacts, run deploy.sh on the instance and wait
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE_REF="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          INSTANCE_ID="$(aws ec2 describe-instances \
+            --filters "Name=tag:Service,Values=vehicle-sales-service" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)"
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running EC2 instance found with tag Service=vehicle-sales-service"
+            exit 1
+          fi
+          echo "Deploying ${GITHUB_SHA} to instance ${INSTANCE_ID}"
+
+          # Ship deploy.sh + docker-compose.prod.yml from the checkout through
+          # the SSM channel (base64, few KB — repo is the source of truth;
+          # user_data does not provision them), then execute the deploy.
+          DEPLOY_B64="$(base64 -w0 deploy/deploy.sh)"
+          COMPOSE_B64="$(base64 -w0 deploy/docker-compose.prod.yml)"
+          PARAMS="$(jq -n --arg d "$DEPLOY_B64" --arg c "$COMPOSE_B64" --arg i "$IMAGE_REF" '{commands: [
+            "set -euo pipefail",
+            "umask 077",
+            "mkdir -p /opt/vehicle-sales-service",
+            ("echo " + $d + " | base64 -d > /opt/vehicle-sales-service/deploy.sh"),
+            ("echo " + $c + " | base64 -d > /opt/vehicle-sales-service/docker-compose.prod.yml"),
+            "chmod 700 /opt/vehicle-sales-service/deploy.sh",
+            ("/opt/vehicle-sales-service/deploy.sh " + $i)
+          ]}')"
+
+          COMMAND_ID="$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:Service,Values=vehicle-sales-service" \
+            --comment "Deploy vehicle-sales-service ${GITHUB_SHA}" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" --output text)"
+
+          for attempt in $(seq 1 60); do
+            sleep 10
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")"
+            echo "Poll ${attempt}/60: ${STATUS}"
+            case "$STATUS" in
+              Success)
+                echo "Deploy command succeeded."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "--- deploy.sh stderr (tail) ---"
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                  --query "StandardErrorContent" --output text || true
+                echo "::error::Deploy command finished with status ${STATUS}"
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::Timed out waiting for the deploy command to finish"
+          exit 1
+
+      # Optional external smoke check: only runs when the APP_PUBLIC_IP repo var
+      # is set (Elastic IP from terraform output). Otherwise deploy.sh's internal
+      # health check (GET /health) is the gate.
+      - name: Public health check
+        if: vars.APP_PUBLIC_IP != ''
+        run: curl -fsS --retry 5 --retry-delay 5 --max-time 10 "http://${{ vars.APP_PUBLIC_IP }}:8000/health"
