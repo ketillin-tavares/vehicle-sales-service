@@ -551,13 +551,22 @@ recurso-a-recurso**, mapeando cada `resource` para o statement que o autoriza na
 (create, plan/refresh, update, destroy). Não confie em "copiei de uma policy que funciona": herdar
 cobre os recursos idênticos, mas **cada edição deliberada é uma hipótese não testada**.
 
-Atenção especial a dois casos que não são óbvios lendo o Terraform:
+Atenção especial a três casos que não são óbvios lendo o Terraform:
 
 1. **Permissões que a AWS exige do *chamador* por efeitos colaterais de serviço.** Não existe nenhum
    `aws_secretsmanager_secret` neste código, e ainda assim `secretsmanager:CreateSecret` é
    obrigatória: `manage_master_user_password = true` faz o RDS criar o segredo usando as permissões
    de quem chamou. Ler o `.tf` nunca revelaria isso — só a doc do serviço.
-2. **Remoções.** Adicionar permissão em excesso falha silenciosamente para o lado seguro; **remover**
+2. **Data source que busca por atributo faz `List` antes do `Get`.** O
+   `data "aws_iam_openid_connect_provider" "github"` localiza o provider pela **URL**, não pelo ARN,
+   então o provider Terraform chama `iam:ListOpenIDConnectProviders` para resolver URL → ARN e só
+   depois `iam:GetOpenIDConnectProvider`. Conceder apenas o `Get` derruba o **`plan`** com
+   `AccessDenied ... is not authorized to perform: iam:ListOpenIDConnectProviders`. Pior: `List` não
+   aceita escopo por recurso, exige `Resource: "*"`, então precisa de statement próprio
+   (`ListOidcProvidersToResolveUrl`). A regra vale para qualquer data source que faça lookup por
+   atributo — nos demais isso passa despercebido só porque estão cobertos por wildcards como
+   `ec2:Describe*`.
+3. **Remoções.** Adicionar permissão em excesso falha silenciosamente para o lado seguro; **remover**
    falha no apply. Este repositório já tem um caso concreto: numa limpeza de menor privilégio,
    `arn:aws:rds:*:*:pg:*` foi retirado do statement `RdsManageDbInstance` sob o argumento de que
    nenhuma stack cria parameter group. Está errado — o

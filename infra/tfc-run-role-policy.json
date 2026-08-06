@@ -184,6 +184,12 @@
       "Resource": "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com"
     },
     {
+      "Sid": "ListOidcProvidersToResolveUrl",
+      "Effect": "Allow",
+      "Action": "iam:ListOpenIDConnectProviders",
+      "Resource": "*"
+    },
+    {
       "Sid": "KmsCreateKey",
       "Effect": "Allow",
       "Action": [
