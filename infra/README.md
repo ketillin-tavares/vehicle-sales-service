@@ -1,10 +1,268 @@
 # Infraestrutura (Terraform) — vehicle-sales-service
 
-Documentação da infraestrutura AWS **de produção** provisionada via Terraform: como está
-estruturada, como configurar o backend remoto, quais variáveis/segredos são necessários e como
-aplicar e fazer deploy. Para desenvolvimento local do serviço, veja o
+Documentação da infraestrutura AWS **de produção** provisionada via Terraform: como aplicar, quais
+variáveis/segredos configurar e como fazer deploy (Parte 1 — Runbook), e por que cada decisão foi
+tomada (Parte 2 — Referência). Para desenvolvimento local do serviço, veja o
 [README raiz](../README.md); para validar esta infraestrutura localmente com um emulador AWS, veja
 [`infra/local/README.md`](./local/README.md).
+
+## Sumário
+
+**Parte 1 — Runbook**
+1. [Pré-requisitos](#1-pré-requisitos)
+2. [Tabela consolidada de variáveis e segredos](#2-tabela-consolidada-de-variáveis-e-segredos)
+3. [Passo a passo](#3-passo-a-passo)
+4. [Operação do dia a dia](#4-operação-do-dia-a-dia)
+
+**Parte 2 — Referência e justificativas**
+- [Recursos provisionados (módulo `stack`)](#recursos-provisionados-módulo-stack)
+- [Custo estimado](#custo-estimado)
+- [O provider OIDC é um recurso compartilhado, e o Core é dono dele](#o-provider-oidc-é-um-recurso-compartilhado-e-o-core-é-dono-dele)
+- [Os identificadores imutáveis do GitHub (`github_owner_id` / `github_repository_id`)](#os-identificadores-imutáveis-do-github-github_owner_id--github_repository_id)
+- [URLs entre serviços devem usar IP privado, nunca o endpoint público](#urls-entre-serviços-devem-usar-ip-privado-nunca-o-endpoint-público)
+- [Por que `PAYMENT_WEBHOOK_TOKEN` nunca é escrito no `.env`](#por-que-payment_webhook_token-nunca-é-escrito-no-env)
+- [Isolamento entre os dois serviços: real no plano de dados, aproximado no plano de controle](#isolamento-entre-os-dois-serviços-real-no-plano-de-dados-aproximado-no-plano-de-controle)
+- [Toda alteração na policy exige vistoria manual — ela não falha no `plan`](#toda-alteração-na-policy-exige-vistoria-manual--ela-não-falha-no-plan)
+- [O caminho de `destroy` nunca foi exercitado](#o-caminho-de-destroy-nunca-foi-exercitado)
+- [Deploy (`deploy/`)](#deploy-deploy)
+- [Referências](#referências)
+
+---
+
+# Parte 1 — Runbook
+
+## 1. Pré-requisitos
+
+- Terraform `>= 1.6.0`, AWS CLI configurada, acesso admin ao repositório no GitHub e a uma
+  organização na HCP Terraform.
+- **A infraestrutura do `vehicle-core-service` precisa estar aplicada antes do primeiro `apply`
+  desta stack** — esta stack lê o provider OIDC do GitHub, dono do Core, via *data source* em tempo
+  de `plan` (não só de `apply`). Ver
+  [O provider OIDC é um recurso compartilhado, e o Core é dono dele](#o-provider-oidc-é-um-recurso-compartilhado-e-o-core-é-dono-dele).
+
+## 2. Tabela consolidada de variáveis e segredos
+
+Todo valor que precisa ser configurado em algum lugar para esta stack funcionar, de ponta a ponta
+(Terraform → TFC → GitHub → SSM). "Quando" indica a ordem: **antes do primeiro apply**, **depois do
+primeiro apply** ou **antes do primeiro deploy**.
+
+| Nome | Tipo | Onde se configura | Valor / origem | Quando |
+|---|---|---|---|---|
+| `github_org` | variável Terraform (**sem** default — obrigatória) | workspace variable (TFC) — categoria *Terraform* | organização/usuário GitHub dono do repositório | antes do primeiro apply |
+| `github_owner_id` | variável Terraform (já tem default) | workspace variable (TFC) — *Terraform*, opcional | default no código (`infra/main/main.tf`); só sobrescreva se o repositório mudar de dono | normalmente nunca |
+| `github_repository_id` | variável Terraform (já tem default) | workspace variable (TFC) — *Terraform*, opcional | default no código (`infra/main/main.tf`); só sobrescreva se o repositório for recriado | normalmente nunca |
+| `aws_region` | variável Terraform (já tem default) | workspace variable (TFC) — *Terraform*, opcional | default `us-east-1` | normalmente nunca |
+| `instance_type` | variável Terraform (já tem default) | workspace variable (TFC) — *Terraform*, opcional | default `t3.micro` | normalmente nunca |
+| `create_github_oidc_provider` | variável Terraform (já tem default) | workspace variable (TFC) — *Terraform*, opcional | default `false` — manter enquanto o Core existir na conta | normalmente nunca |
+| `enable_github_oidc` | variável Terraform de uso interno do módulo | **não configurável nesta raiz** — `infra/main` não declara essa variável, então nenhum valor de workspace chega a ela | sempre resolve para o default do módulo (`true`) em produção; só é `false` na raiz `infra/local` | N/A em produção |
+| `TFC_AWS_PROVIDER_AUTH` | workspace variable (TFC) — categoria *Environment* | workspace `vehicle-sales-infra`, aba *Variables* | `true` | antes do primeiro apply |
+| `TFC_AWS_RUN_ROLE_ARN` | workspace variable (TFC) — categoria *Environment* | workspace `vehicle-sales-infra`, aba *Variables* | ARN da role `vehicle-sales-infra-tfc` (passo 2) | antes do primeiro apply |
+| `TF_API_TOKEN` | GitHub secret (repositório) | *Settings → Secrets and variables → Actions → Secrets* | token de time da HCP Terraform, restrito ao workspace | antes do primeiro apply |
+| `TF_CLOUD_ORGANIZATION` | GitHub repository variable | *Settings → Secrets and variables → Actions → Variables* | organização na HCP Terraform | antes do primeiro apply |
+| `TF_WORKSPACE` | GitHub repository variable | idem | `vehicle-sales-infra` | antes do primeiro apply |
+| `SONAR_TOKEN` | GitHub secret (repositório), opcional | idem, *Secrets* | token gerado no SonarCloud | antes do primeiro deploy |
+| `SONAR_PROJECT_KEY` | GitHub repository variable, opcional | idem, *Variables* | project key do SonarCloud | antes do primeiro deploy |
+| `SONAR_ORGANIZATION` | GitHub repository variable, opcional | idem, *Variables* | organization key do SonarCloud | antes do primeiro deploy |
+| `AWS_ROLE_ARN` | GitHub secret (repositório) | idem, *Secrets* | output `deploy_role_arn` do Terraform | depois do primeiro apply |
+| `AWS_REGION` | GitHub repository variable | idem, *Variables* | mesma região de `aws_region` | depois do primeiro apply |
+| `APP_PUBLIC_IP` | GitHub repository variable, opcional | idem, *Variables* | output `elastic_ip` | depois do primeiro apply |
+| `INTERNAL_API_TOKEN` | parâmetro SSM (`SecureString`) | `aws ssm put-parameter --overwrite` (fora do Terraform) | byte-idêntico ao `/vehicle-core-service/INTERNAL_API_TOKEN` do Core | depois do primeiro apply, antes do primeiro deploy |
+| `PAYMENT_WEBHOOK_TOKEN` | parâmetro SSM (`SecureString`) | idem | string aleatória com 32+ bytes, exclusiva do Sales | depois do primeiro apply, antes do primeiro deploy |
+| `CORE_SERVICE_BASE_URL` | parâmetro SSM (`SecureString`) | idem | `http://<ip-privado-do-core>:8000` | depois do primeiro apply, antes do primeiro deploy |
+| `CORE_SERVICE_TIMEOUT_SECONDS` | parâmetro SSM (`SecureString`) | idem | `5` | depois do primeiro apply, antes do primeiro deploy |
+| `SERVICE_NAME` | parâmetro SSM (`SecureString`) | idem | `vehicle-sales-service` | depois do primeiro apply, antes do primeiro deploy |
+| `DEBUG` | parâmetro SSM (`SecureString`) | idem | `false` | depois do primeiro apply, antes do primeiro deploy |
+| `LOG_LEVEL` | parâmetro SSM (`SecureString`) | idem | `INFO` | depois do primeiro apply, antes do primeiro deploy |
+| `DATABASE_HOST` / `DATABASE_PORT` / `DATABASE_USER` / `DATABASE_NAME` / `DATABASE_PASSWORD_SECRET_ARN` | parâmetro SSM (`String`, gerenciado pelo Terraform) | escrito automaticamente a partir do `aws_db_instance.app` | derivado do RDS | automático — nenhuma ação |
+
+> `DATABASE_PASSWORD` não aparece nesta tabela: nunca é configurado por ninguém. Vive no segredo
+> gerenciado pelo RDS no Secrets Manager (`manage_master_user_password = true`) e é lido em runtime
+> pelo `deploy.sh` via `DATABASE_PASSWORD_SECRET_ARN`.
+
+## 3. Passo a passo
+
+1. **Criar o workspace na HCP Terraform.**
+   - Nome `vehicle-sales-infra`, fluxo **CLI-driven** (sem conexão VCS).
+   - **Execution Mode:** Remote.
+   - **Apply Method:** Auto apply (o gate humano fica no ambiente `infra` do GitHub, passo 5).
+   - **Terraform Working Directory:** `infra/main`.
+   - **Credenciais dinâmicas do provider são obrigatórias** — chaves AWS estáticas como variável de
+     workspace são proibidas. Ver
+     [Dynamic Provider Credentials da HCP Terraform para AWS](https://developer.hashicorp.com/terraform/cloud-docs/workspaces/dynamic-provider-credentials/aws-configuration).
+   - Localmente, `terraform init` em `infra/main` lê organização/workspace de variáveis de ambiente
+     (o bloco `cloud {}` não aceita variáveis do Terraform):
+     ```bash
+     export TF_CLOUD_ORGANIZATION=<sua-organização-hcp-terraform>
+     export TF_WORKSPACE=vehicle-sales-infra
+     ```
+
+2. **Criar a run role na AWS**, a partir dos dois JSONs já versionados em `infra/` — usando uma
+   identidade admin/bootstrap.
+
+   Pela **CLI** (edite antes os placeholders da trust policy — ver abaixo):
+   ```bash
+   cd infra
+   aws iam create-role --role-name vehicle-sales-infra-tfc \
+     --assume-role-policy-document file://tfc-run-role-trust-policy.json
+
+   aws iam put-role-policy --role-name vehicle-sales-infra-tfc \
+     --policy-name vehicle-sales-infra-tfc-policy \
+     --policy-document file://tfc-run-role-policy.json
+   ```
+   Ou pelo **console** (IAM):
+   1. *Roles* → *Create role* → **Web identity** → provider `app.terraform.io` → crie a role e
+      edite a trust policy colando o conteúdo integral de `tfc-run-role-trust-policy.json`.
+   2. Na role, *Add permissions* → *Create inline policy* → JSON, colando `tfc-run-role-policy.json`.
+   3. Copie o **ARN da role** — é o valor de `TFC_AWS_RUN_ROLE_ARN` (tabela da seção 2).
+
+   **Placeholders a substituir em cada arquivo:**
+   - `tfc-run-role-trust-policy.json` — exatamente 3: `<AWS_ACCOUNT_ID>` (id numérico da conta),
+     `<TFC_ORG>` (organização HCP Terraform), `<TFC_PROJECT>` (projeto do workspace — `Default
+     Project` se você não criou nenhum).
+   - `tfc-run-role-policy.json` — nenhum obrigatório; ajuste `aws:RequestedRegion` só se não usar
+     `us-east-1`.
+
+   Diferente do bootstrap do Core, **não rode `aws iam create-open-id-connect-provider`** aqui: o
+   provider `app.terraform.io` já deve existir na conta (criado quando o Core foi bootstrapado). Se
+   esta for a primeira stack da conta, crie-o seguindo o passo equivalente do
+   `vehicle-core-service/infra/README.md` antes de continuar.
+
+   > ⚠️ **Toda vez que `tfc-run-role-policy.json` mudar no repositório, re-cole o JSON na role.**
+   > A inline policy da role **não** acompanha o git — o conteúdo do arquivo só chega à AWS quando
+   > você o cola de novo:
+   > ```bash
+   > cd infra
+   > aws iam put-role-policy --role-name vehicle-sales-infra-tfc \
+   >   --policy-name vehicle-sales-infra-tfc-policy \
+   >   --policy-document file://tfc-run-role-policy.json
+   > ```
+   > Ou no console: role `vehicle-sales-infra-tfc` → *Permissions* → policy inline → *Edit* → JSON →
+   > *Save*. Só depois rode o `infra.yml` de novo. Sintoma típico de policy desatualizada:
+   > `AccessDenied` ou `KMSKeyNotAccessibleFault` no apply.
+
+3. **Configurar as variáveis do workspace na TFC**, conforme a tabela da seção 2 (categorias
+   *Environment* e *Terraform*; só `github_org` é obrigatória, as demais já têm default). **Nunca**
+   defina `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` como variável de workspace — credenciais
+   estáticas conflitam com a autenticação dinâmica.
+
+4. **Configurar o SonarCloud.**
+   1. Em [sonarcloud.io](https://sonarcloud.io), login com GitHub → *Analyze new project* → importe
+      o repositório `vehicle-sales-service` (anote *project key* e *organization key*).
+   2. No projeto → *Administration* → *Analysis Method* → **desligue Automatic Analysis**
+      (obrigatório — conflita com a análise via CI).
+   3. *My Account* → *Security* → gere um token.
+   4. Guarde token/project key/organization key para o passo seguinte.
+
+5. **Configurar no GitHub (nível do repositório) o que o primeiro `apply` exige:**
+   - Criar o **environment `infra`** (*Settings → Environments → New environment*, nome exato
+     `infra`) com **Required reviewers** habilitado (adicione você mesmo). Sem ele o workflow roda
+     sem nenhum gate humano.
+   - *Settings → Secrets and variables → Actions*:
+     - Secret `TF_API_TOKEN` (token de time gerado na TFC, escopo restrito ao workspace, com
+       expiração definida).
+     - Variáveis `TF_CLOUD_ORGANIZATION` e `TF_WORKSPACE=vehicle-sales-infra`.
+     - Secret `SONAR_TOKEN` e variáveis `SONAR_PROJECT_KEY`/`SONAR_ORGANIZATION` (passo 4).
+
+6. **Rodar o workflow `infra.yml`** (`workflow_dispatch`, `action=apply`) — protegido pelo ambiente
+   `infra`. **Confirme antes que o Core já foi aplicado** (pré-requisito da seção 1). Alternativa
+   manual, a partir de `infra/main`:
+   ```bash
+   cd infra/main
+   terraform init -input=false
+   terraform validate
+   terraform plan -input=false
+   terraform apply -auto-approve -input=false
+   ```
+
+7. **Configurar no GitHub os secrets/variáveis que só existem depois do apply**, usando os outputs
+   do Terraform (mesmo caminho do passo 5):
+   - Secret `AWS_ROLE_ARN` = output `deploy_role_arn`.
+   - Variável `AWS_REGION` = mesma região de `aws_region`.
+   - Variável opcional `APP_PUBLIC_IP` = output `elastic_ip` (habilita o smoke test externo da CD).
+
+   Até `AWS_ROLE_ARN` existir, o job de deploy do `cd.yml` não consegue assumir a role — efeito
+   ovo-e-galinha esperado.
+
+8. **Configurar os 7 parâmetros SSM `SecureString`** (nascem com o placeholder `CHANGE_ME`; o
+   `deploy.sh` recusa o deploy enquanto qualquer um estiver assim):
+   ```bash
+   P=/vehicle-sales-service
+
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/INTERNAL_API_TOKEN --value '<mesmo valor configurado no Core>'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/PAYMENT_WEBHOOK_TOKEN --value '<token aleatório com 32+ bytes, único>'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/CORE_SERVICE_BASE_URL --value 'http://<ip-privado-do-core>:8000'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/CORE_SERVICE_TIMEOUT_SECONDS --value '5'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/SERVICE_NAME --value 'vehicle-sales-service'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/DEBUG --value 'false'
+   aws ssm put-parameter --overwrite --type SecureString \
+     --name $P/LOG_LEVEL --value 'INFO'
+   ```
+   `INTERNAL_API_TOKEN` precisa ser **byte-idêntico** ao configurado no Core; `CORE_SERVICE_BASE_URL`
+   usa o **IP privado** da instância do Core, nunca o endpoint público — ver
+   [URLs entre serviços devem usar IP privado](#urls-entre-serviços-devem-usar-ip-privado-nunca-o-endpoint-público).
+
+9. **Rodar o workflow `cd.yml`** — dispara automaticamente em todo push em `main` que toque
+   `service/**` ou `deploy/**`, ou manualmente via `workflow_dispatch`. Faz build/push da imagem no
+   ECR e deploy remoto na EC2 via SSM Run Command.
+
+10. **Verificação pós-deploy.**
+    - O próprio `deploy.sh` já bloqueia o job da CD se `GET /health` (interno) não responder.
+    - Se `APP_PUBLIC_IP` estiver configurado, o `cd.yml` roda também um smoke test externo:
+      `curl http://<APP_PUBLIC_IP>:8000/health`.
+    - Para inspecionar logs/estado remotamente, use SSM Run Command (`AWS-RunShellScript`) contra a
+      instância marcada com a tag `Service=vehicle-sales-service`, executando
+      `docker compose -f docker-compose.prod.yml ps` / `logs`.
+
+11. **Fechar o círculo com o Core** — as duas URLs entre serviços precisam apontar para o **IP
+    privado** do par:
+    ```bash
+    # IP privado desta instância (Sales), para configurar no Core:
+    aws ec2 describe-instances \
+      --filters "Name=tag:Service,Values=vehicle-sales-service" "Name=instance-state-name,Values=running" \
+      --query "Reservations[0].Instances[0].PrivateIpAddress" --output text
+
+    # No workspace/conta do Core, atualize e reinicie o app para pegar o novo valor:
+    aws ssm put-parameter --overwrite --type SecureString \
+      --name /vehicle-core-service/SALES_SERVICE_BASE_URL --value 'http://<ip-privado-do-sales>:8000'
+    ```
+    `CORE_SERVICE_BASE_URL` (aqui, passo 8) já deve ter sido configurado com o IP privado do Core.
+    Sem os dois lados apontando corretamente, as chamadas internas retornam timeout/5xx — ver
+    [URLs entre serviços devem usar IP privado](#urls-entre-serviços-devem-usar-ip-privado-nunca-o-endpoint-público).
+
+## 4. Operação do dia a dia
+
+- **Redeploy** (mesma imagem ou nova versão): push em `main` tocando `service/**`/`deploy/**`, ou
+  disparo manual do `cd.yml` (`workflow_dispatch`).
+- **Alterar um segredo já configurado:**
+  ```bash
+  aws ssm put-parameter --overwrite --type SecureString \
+    --name /vehicle-sales-service/<CHAVE> --value '<novo-valor>'
+  ```
+  Depois, rode o `cd.yml` — o `deploy.sh` só relê o SSM a cada deploy, um `put-parameter` isolado
+  não reinicia o container.
+- **Aplicar uma mudança de infraestrutura** (`infra/stack/*.tf`):
+  1. Valide localmente com `./infra/local/floci-validate.sh --apply` antes de abrir o PR.
+  2. Se a mudança tocou em permissões necessárias, revise `tfc-run-role-policy.json`
+     recurso-a-recurso — ver
+     [Toda alteração na policy exige vistoria manual](#toda-alteração-na-policy-exige-vistoria-manual--ela-não-falha-no-plan).
+  3. Se `tfc-run-role-policy.json` mudou, **re-cole o JSON na role na AWS** (⚠️ do passo 2 — o git
+     não propaga isso sozinho).
+  4. Rode o `infra.yml` (`action=apply`).
+- **Destruir a stack:** `infra.yml` (`action=destroy`, `confirm=vehicle-sales-service`) ou
+  `terraform destroy` manual a partir de `infra/main`. Se a intenção é derrubar a conta inteira
+  (Core + Sales), **destrua esta stack (Sales) primeiro** — ver
+  [`prevent_destroy` no Core](#prevent_destroy-no-core-e-o-que-isso-significa-para-o-destroy-da-conta-inteira)
+  e [O caminho de `destroy` nunca foi exercitado](#o-caminho-de-destroy-nunca-foi-exercitado).
+
+---
+
+# Parte 2 — Referência e justificativas
 
 Esta é a **segunda** stack de infraestrutura da plataforma. O `vehicle-core-service` já provisiona
 uma stack equivalente (mesmo módulo, recursos com nomes trocados) na mesma conta AWS. As duas
@@ -92,12 +350,14 @@ local em [`infra/local/README.md`](./local/README.md).
   - `String` gerenciados pelo Terraform (derivados do RDS, não são segredos): `DATABASE_HOST`,
     `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_NAME`, `DATABASE_PASSWORD_SECRET_ARN`.
 
-Custo estimado: EC2 `t3.micro` (~US$ 8/mês) + RDS `db.t4g.micro` (~US$ 12/mês) + 36 GB `gp3`
-(~US$ 4/mês) + 2 KMS CMKs (~US$ 2/mês) ≈ **US$ 26/mês**, adicionais ao custo do Core. **Esta
-instância NÃO é elegível ao free tier**: as cotas de 750h/mês de EC2 e de RDS são por conta AWS, não
-por instância, e já são consumidas pela instância do `vehicle-core-service`. Diferente do README do
-Core (que ainda descreve as duas instâncias como elegíveis ao free tier em contas novas), a partir
-do momento em que este stack existe na mesma conta, o custo real passa a ser a soma das duas.
+## Custo estimado
+
+EC2 `t3.micro` (~US$ 8/mês) + RDS `db.t4g.micro` (~US$ 12/mês) + 36 GB `gp3` (~US$ 4/mês) + 2 KMS
+CMKs (~US$ 2/mês) ≈ **US$ 26/mês**, adicionais ao custo do Core. **Esta instância NÃO é elegível ao
+free tier**: as cotas de 750h/mês de EC2 e de RDS são por conta AWS, não por instância, e já são
+consumidas pela instância do `vehicle-core-service`. Diferente do README do Core (que ainda descreve
+as duas instâncias como elegíveis ao free tier em contas novas), a partir do momento em que este
+stack existe na mesma conta, o custo real passa a ser a soma das duas.
 
 ## O provider OIDC é um recurso compartilhado, e o Core é dono dele
 
@@ -128,7 +388,8 @@ variable "enable_github_oidc" {
   a data source/o recurso do provider são avaliados). É `false` **somente** na raiz `infra/local`
   (Floci): o emulador não implementa nem `CreateOpenIDConnectProvider` nem
   `GetOpenIDConnectProvider`, então tanto o recurso quanto a data source precisam ser descontados lá
-  — não só o recurso, como no Core.
+  — não só o recurso, como no Core. Ela não está exposta em `infra/main` (produção sempre usa o
+  default `true` do módulo — ver a tabela da seção 2).
 
 **Por que não bastava uma flag só (como no Core).** No módulo do Core, uma única flag
 (`create_github_oidc`) controla ao mesmo tempo a criação do provider **e** a criação da role de
@@ -167,205 +428,28 @@ seguir mesmo assim é preciso um `terraform state rm aws_iam_openid_connect_prov
 deliberado no workspace do Core (ou remover temporariamente o bloco `lifecycle` do `.tf` e reaplicar
 antes do destroy) — nunca um passo automático do pipeline.
 
-## `github_repository_id` não tem default de propósito
+## Os identificadores imutáveis do GitHub (`github_owner_id` / `github_repository_id`)
 
-```hcl
-variable "github_repository_id" {
-  # REPOSITORY-SPECIFIC and DELIBERATELY WITHOUT A DEFAULT
-  type = string
-}
-```
+Ambas as variáveis já vêm com **default correto** no módulo (`infra/stack/variables.tf` e
+`infra/main/main.tf`), do mesmo jeito que no Core — **não é preciso defini-las no workspace da TFC**.
+O `github_owner_id` é o mesmo dos dois repositórios (mesma conta); o `github_repository_id` é
+específico deste repositório e **diferente do valor usado no Core**.
 
-Diferente de `github_owner_id` (que tem default — mesmo dono de conta do Core, mesmo `<owner_id>` em
-ambos os repositórios), `github_repository_id` **não tem default**: o Terraform recusa o `plan` sem
-essa variável definida explicitamente no workspace da TFC. É proposital — leia a seção
-`vehicle-core-service/infra/README.md#oidc-do-github-actions-o-sub-real-usa-identificadores-imutáveis-id`
-para o histórico completo do problema que essa variável resolve: o `sub` real emitido pelo GitHub
-usa a forma `repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/main`, e um `repo_id` errado
-(ou emprestado do Core) produz uma negação **opaca** de `AssumeRoleWithWebIdentity` — nada no log da
-Action aponta para a causa.
+Por que essas variáveis existem: o `sub` que o GitHub realmente emite usa a forma
+`repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/main`, e a trust policy fixa strings
+exatas. Um `repo_id` errado — tipicamente **emprestado do Core numa cópia de arquivo** — produz uma
+negação **opaca** de `AssumeRoleWithWebIdentity`: nada no log da Action aponta para a causa, e todos
+os campos visíveis parecem corretos. O histórico completo do incidente está em
+`vehicle-core-service/infra/README.md#oidc-do-github-actions-o-sub-real-usa-identificadores-imutáveis-id`,
+inclusive como diagnosticar pelo CloudTrail (o campo `userName` do evento **é** a claim `sub`).
 
-Como encontrar o id correto deste repositório:
+Só mexa nesses valores se o repositório for **recriado** — o id é imutável a renomeações, que é
+justamente o motivo de o GitHub usá-lo na claim. Se precisar reconferir:
 
 ```bash
-curl -s https://api.github.com/repos/<owner>/vehicle-sales-service | jq '.id'
+curl -s https://api.github.com/repos/<owner>/vehicle-sales-service | jq '.id'        # <repo_id>
+curl -s https://api.github.com/users/<owner> | jq '.id'                              # <owner_id>
 ```
-
-Anote o valor (`<repo_id>`, um número) e defina-o como variável do workspace `vehicle-sales-infra`
-na TFC — **nunca** o mesmo valor usado no workspace do Core: mesmo dono (`<owner_id>`), repositório
-diferente, id diferente.
-
-## Configuração do backend (Terraform Cloud / HCP Terraform)
-
-A raiz `infra/main` usa um bloco `cloud {}` (execução e state remotos). Organização e workspace vêm
-de variáveis de ambiente, não de variáveis do Terraform:
-
-```bash
-export TF_CLOUD_ORGANIZATION=<sua-organização-hcp-terraform>
-export TF_WORKSPACE=vehicle-sales-infra
-```
-
-### Configurações do workspace (UI da TFC)
-
-- Workspace `vehicle-sales-infra`, fluxo **CLI-driven** (sem conexão VCS).
-- **Execution Mode:** Remote.
-- **Apply Method:** Auto apply — o gate humano fica no ambiente `infra` do GitHub (revisores
-  obrigatórios), não na TFC.
-- **Terraform Working Directory:** `infra/main`. Com ele definido, a CLI precisa rodar a partir do
-  diretório correspondente — o `infra.yml` já faz isso; o upload da configuração inclui `../stack`.
-
-### Bootstrap do workspace (manual, uma única vez)
-
-1. Criar o workspace na UI com as configurações da seção acima.
-2. **Credenciais dinâmicas do provider são obrigatórias** — chaves AWS estáticas como variáveis de
-   workspace são **proibidas**. Ver
-   [Dynamic Provider Credentials da HCP Terraform para AWS](https://developer.hashicorp.com/terraform/cloud-docs/workspaces/dynamic-provider-credentials/aws-configuration).
-3. Criar a **TFC run role** a partir dos arquivos de política já versionados no repositório
-   (`infra/tfc-run-role-trust-policy.json` e `infra/tfc-run-role-policy.json`), usando uma
-   identidade admin/bootstrap.
-
-   Pela **CLI** (antes, edite os 3 placeholders em `tfc-run-role-trust-policy.json` — ver
-   sub-passo 2 abaixo):
-
-   ```bash
-   cd infra
-   aws iam create-role --role-name vehicle-sales-infra-tfc \
-     --assume-role-policy-document file://tfc-run-role-trust-policy.json
-
-   aws iam put-role-policy --role-name vehicle-sales-infra-tfc \
-     --policy-name vehicle-sales-infra-tfc-policy \
-     --policy-document file://tfc-run-role-policy.json
-   ```
-
-   Repare que, diferente do bootstrap do Core, **não há `aws iam create-open-id-connect-provider`
-   aqui** — o provider `app.terraform.io` (usado pelas credenciais dinâmicas da TFC) é distinto do
-   provider `token.actions.githubusercontent.com` (usado pelo deploy do GitHub Actions) e precisa
-   existir mesmo assim; se a conta ainda não o tiver de quando o Core foi criado, crie-o seguindo o
-   passo equivalente do `vehicle-core-service/infra/README.md`.
-
-   Ou pelo **console** (IAM), em vez da CLI:
-
-   1. *Roles* → *Create role* → **Web identity** → provider `app.terraform.io` → crie a role e edite
-      a trust policy colando o conteúdo integral de `tfc-run-role-trust-policy.json`.
-   2. No JSON colado, substitua **exatamente 3 placeholders**: `<AWS_ACCOUNT_ID>` (ID numérico da
-      conta), `<TFC_ORG>` (organização da HCP Terraform) e `<TFC_PROJECT>` (projeto que contém o
-      workspace — `Default Project` caso você não tenha criado nenhum). Nada mais precisa mudar.
-   3. Na role, *Add permissions* → *Create inline policy* → JSON, colando
-      `tfc-run-role-policy.json` (ajuste `aws:RequestedRegion` se não usar `us-east-1`).
-   4. Copie o **ARN da role** — ele é o valor de `TFC_AWS_RUN_ROLE_ARN` no passo 4 abaixo.
-
-   - `tfc-run-role-trust-policy.json`: trust fixado em `aud = aws.workload.identity` e
-     `sub = organization:<TFC_ORG>:project:<TFC_PROJECT>:workspace:vehicle-sales-infra:run_phase:*`
-     — org/projeto/workspace exatos, wildcard apenas em `run_phase` (mesmo raciocínio do Core: uma
-     única role cobre as fases `plan` e `apply`).
-   - `tfc-run-role-policy.json`: permissões de menor privilégio, restritas a recursos
-     `vehicle-sales-service*` sempre que a AWS permite. A única leitura fora desse escopo é
-     `iam:GetOpenIDConnectProvider` sobre o provider compartilhado do GitHub (statement
-     `ReadSharedGithubOidcProvider`) — **sem** `Create`/`Delete`/`UpdateOpenIDConnectProviderThumbprint`,
-     ao contrário da policy do Core: esta run role fisicamente não consegue apagar nem alterar o
-     provider do Core, mesmo que quisesse.
-
-   > ⚠️ **Toda vez que `tfc-run-role-policy.json` mudar no repositório, re-cole o JSON na role.**
-   > A inline policy da role **não** acompanha o git: o conteúdo do arquivo só chega à AWS quando
-   > você o cola de novo (console: role `vehicle-sales-infra-tfc` → *Permissions* → policy inline →
-   > *Edit* → JSON → *Save*; ou repita o `aws iam put-role-policy` acima). Depois disso, rode o
-   > `infra.yml` novamente. Sintoma típico de policy desatualizada: `AccessDenied` ou
-   > `KMSKeyNotAccessibleFault` no apply — o mesmo ponto cego documentado no README do Core: o
-   > Floci nunca pega esse tipo de erro, porque não implementa autorização IAM.
-
-4. Variáveis do workspace na TFC:
-   - Ambiente: `TFC_AWS_PROVIDER_AUTH=true` e
-     `TFC_AWS_RUN_ROLE_ARN=<ARN da role vehicle-sales-infra-tfc>`.
-   - Terraform: `github_org` (obrigatória), `github_repository_id` (**obrigatória, sem default** —
-     ver seção acima), opcionalmente `github_owner_id` / `aws_region` / `instance_type` /
-     `create_github_oidc_provider` (mantenha `false` enquanto o Core existir).
-   - **Nunca** defina `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` no workspace — credenciais
-     estáticas conflitam com a autenticação dinâmica.
-5. Variáveis de ambiente para o `terraform init` em `infra/main` (a CI também as define):
-   `TF_CLOUD_ORGANIZATION=<org>`, `TF_WORKSPACE=vehicle-sales-infra` (o bloco `cloud {}` as lê).
-6. Gerar um **token de time restrito ao time deste workspace** (nunca um token de usuário ou de
-   organização inteira). Defina uma expiração (ex.: 90 dias) e rotacione periodicamente — ele será
-   salvo no GitHub no passo 8.
-7. Criar o **environment `infra` no GitHub** (nível de *Settings* do repositório — exige admin):
-   *Settings* → *Environments* → *New environment* → nome `infra` (exato — o `infra.yml` o
-   referencia) → habilite **Required reviewers** e adicione você mesmo → salve as regras de
-   proteção. Sem esse environment o workflow ainda roda, porém **sem nenhum gate humano**; com ele,
-   toda execução do `infra.yml` (apply **e** destroy) pausa aguardando aprovação.
-8. Configurar no GitHub (*Settings* → *Secrets and variables* → *Actions*, nível do repositório) o
-   mínimo que o primeiro run do `infra.yml` exige:
-   - Secret `TF_API_TOKEN` = token de time do passo 6.
-   - Variável `TF_CLOUD_ORGANIZATION` = sua organização na HCP Terraform.
-   - Variável `TF_WORKSPACE` = `vehicle-sales-infra`.
-
-   Os demais secrets/variáveis dependem de outputs do Terraform e só entram **depois** do primeiro
-   apply (seção seguinte). A tabela consolidada fica em
-   [Segredos e variáveis do GitHub Actions](#segredos-e-variáveis-do-github-actions).
-9. Configurar o **SonarCloud** — mesmo procedimento do Core (login com GitHub, importar o
-   repositório `vehicle-sales-service`, desligar Automatic Analysis, gerar token, configurar
-   `SONAR_TOKEN`/`SONAR_PROJECT_KEY`/`SONAR_ORGANIZATION` no GitHub). Sem `SONAR_TOKEN` os steps do
-   Sonar são pulados sem quebrar a CI/CD; com ele, o CI analisa PRs e o CD bloqueia o deploy se o
-   quality gate reprovar.
-
-### Primeiro apply → secrets/variáveis pós-apply (destravam o `cd.yml`)
-
-1. Rode o workflow `infra.yml` (ou, a partir de `infra/main`: `terraform init && terraform apply`
-   com as variáveis de ambiente acima). **Confirme antes que o Core já foi aplicado** — ver
-   [Ordem de apply obrigatória](#ordem-de-apply-obrigatória-core-primeiro).
-2. Com os outputs do apply, configure no GitHub (mesmo caminho do passo 8 do bootstrap — nível do
-   repositório):
-   - Secret `AWS_ROLE_ARN` = output `deploy_role_arn`.
-   - Variável `AWS_REGION` = mesma região de `aws_region` (`us-east-1` por padrão).
-   - Variável opcional `APP_PUBLIC_IP` = output `elastic_ip` (usada no smoke test externo da CD).
-3. Esses valores destravam o `cd.yml` (deploy), não o `infra.yml`: até o secret `AWS_ROLE_ARN`
-   existir, o job de deploy da CD não consegue assumir a role (efeito ovo-e-galinha esperado).
-
-## Aplicando a infraestrutura
-
-Manualmente, a partir de `infra/main`:
-
-```bash
-cd infra/main
-terraform init -input=false
-terraform validate
-terraform plan -input=false
-terraform apply -auto-approve -input=false
-```
-
-Ou disparando o workflow **Infra** (`workflow_dispatch`) no GitHub Actions — protegido pelo
-ambiente `infra` (requer revisores aprovadores configurados em *Settings > Environments*) e, para
-`destroy`, pela confirmação explícita do input `confirm = vehicle-sales-service`.
-
-## Segredos que precisam ser configurados fora do Terraform
-
-Três parâmetros `SecureString` nascem com o placeholder `CHANGE_ME` (definido pelo Terraform, com
-`lifecycle.ignore_changes` sobre o valor) e **precisam ser configurados manualmente, uma vez por
-ambiente**, depois do primeiro apply. O `deploy.sh` recusa o deploy (imprimindo apenas os **nomes**
-das chaves, nunca valores) enquanto qualquer um deles ainda estiver `CHANGE_ME`:
-
-```bash
-aws ssm put-parameter --overwrite --type SecureString \
-  --name /vehicle-sales-service/INTERNAL_API_TOKEN --value '<mesmo valor definido no Core>'
-
-aws ssm put-parameter --overwrite --type SecureString \
-  --name /vehicle-sales-service/PAYMENT_WEBHOOK_TOKEN --value '<token aleatório com 32+ bytes, único>'
-
-aws ssm put-parameter --overwrite --type SecureString \
-  --name /vehicle-sales-service/CORE_SERVICE_BASE_URL --value 'http://<ip-privado-do-core>:8000'
-# repita para: CORE_SERVICE_TIMEOUT_SECONDS, SERVICE_NAME, DEBUG, LOG_LEVEL
-```
-
-- **`INTERNAL_API_TOKEN`** — precisa ser **byte-idêntico** ao valor configurado no
-  `/vehicle-core-service/INTERNAL_API_TOKEN` do Core. É o token comparado em tempo constante nas
-  chamadas internas entre serviços (`X-Internal-Token`); qualquer divergência — um espaço a mais,
-  um caractere trocado — faz **toda** chamada interna retornar 401, dos dois lados.
-- **`PAYMENT_WEBHOOK_TOKEN`** — exclusivo do Sales, valida o header `X-Webhook-Token` do webhook de
-  pagamento voltado para a internet (`POST /webhooks/v1/payments`). **Nunca deve compartilhar valor
-  com `INTERNAL_API_TOKEN`**: são superfícies de ataque diferentes — o webhook é exposto
-  publicamente (provedor de pagamento externo), o token interno não é. Reaproveitar o mesmo segredo
-  para os dois faria um vazamento do webhook (mais exposto) comprometer também a comunicação
-  interna entre serviços.
-- **`CORE_SERVICE_BASE_URL`** — ver a seção seguinte: deve apontar para o **IP privado** da
-  instância do Core, não para um endpoint público.
 
 ## URLs entre serviços devem usar IP privado, nunca o endpoint público
 
@@ -407,6 +491,15 @@ nunca usa `PAYMENT_WEBHOOK_TOKEN` — ele só roda `alembic upgrade head`. Mas `
 container de migrations morre com um `pydantic.ValidationError` antes mesmo de tentar conectar no
 banco. Por isso `docker-compose.prod.yml` declara `PAYMENT_WEBHOOK_TOKEN` (e `INTERNAL_API_TOKEN`)
 no serviço `migrations` também, não só no serviço da aplicação.
+
+**Também vale para `INTERNAL_API_TOKEN`:** é o token comparado em tempo constante nas chamadas
+internas entre serviços (`X-Internal-Token`); precisa ser **byte-idêntico** ao valor configurado no
+Core — qualquer divergência (um espaço a mais, um caractere trocado) faz **toda** chamada interna
+retornar 401, dos dois lados. `PAYMENT_WEBHOOK_TOKEN` valida o header `X-Webhook-Token` do webhook de
+pagamento voltado para a internet (`POST /webhooks/v1/payments`) e **nunca deve compartilhar valor
+com `INTERNAL_API_TOKEN`**: são superfícies de ataque diferentes — o webhook é exposto publicamente
+(provedor de pagamento externo), o token interno não é. Reaproveitar o mesmo segredo para os dois
+faria um vazamento do webhook (mais exposto) comprometer também a comunicação interna entre serviços.
 
 ## Isolamento entre os dois serviços: real no plano de dados, aproximado no plano de controle
 
@@ -522,44 +615,6 @@ nem checkout de repositório na instância.
 O workflow `cd.yml` envia `deploy.sh` e `docker-compose.prod.yml` do próprio checkout para a
 instância (em base64, pelo canal do SSM) antes de executar o deploy — o `user_data` da EC2 apenas
 prepara o Docker, o repositório é a fonte da verdade dos artefatos de deploy.
-
-## Variáveis de ambiente e segredos
-
-Todos os nomes abaixo correspondem exatamente ao arquivo
-[`service/env.example`](../service/env.example) do serviço. **Nunca** commite valores reais — apenas
-os nomes das chaves.
-
-| Variável | Descrição | Exemplo | Origem em produção |
-|---|---|---|---|
-| `DATABASE_HOST` | Host do PostgreSQL | `vehicle-sales-db.xxxxx.us-east-1.rds.amazonaws.com` | Terraform (endpoint do RDS) |
-| `DATABASE_PORT` | Porta do PostgreSQL | `5432` | Terraform (porta do RDS) |
-| `DATABASE_USER` | Usuário de conexão com o banco | `vehicle_sales_user` | Terraform (usuário master do RDS) |
-| `DATABASE_PASSWORD` | Senha de conexão com o banco | *(gerada, não versionada)* | Secrets Manager, referenciado pela SSM `DATABASE_PASSWORD_SECRET_ARN`; materializada em runtime pelo `deploy.sh` |
-| `DATABASE_NAME` | Nome do banco de dados | `vehicle_sales` | Terraform (nome do banco no RDS) |
-| `CORE_SERVICE_BASE_URL` | URL base do `vehicle-core-service` | `http://<ip-privado-do-core>:8000` | SSM `SecureString` (`CHANGE_ME` até ser definida manualmente — use o IP privado, não o público) |
-| `CORE_SERVICE_TIMEOUT_SECONDS` | Timeout, em segundos, das chamadas HTTP ao serviço de catálogo | `5.0` | SSM `SecureString` |
-| `INTERNAL_API_TOKEN` | Token compartilhado exigido no header `X-Internal-Token` das rotas internas entre serviços — **byte-idêntico** ao do Core | *(string aleatória com 32+ bytes)* | SSM `SecureString` |
-| `PAYMENT_WEBHOOK_TOKEN` | Token exigido no header `X-Webhook-Token` do webhook de pagamento — exclusivo do Sales, nunca compartilha valor com `INTERNAL_API_TOKEN` | *(string aleatória com 32+ bytes, distinta do token interno)* | SSM `SecureString` |
-| `SERVICE_NAME` | Nome do serviço usado em logs e no health check | `vehicle-sales-service` | SSM `SecureString` |
-| `DEBUG` | Habilita modo debug (echo de SQL, logs verbosos) | `false` | SSM `SecureString` |
-| `LOG_LEVEL` | Nível mínimo de log | `INFO` | SSM `SecureString` |
-
-`DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER` e `DATABASE_NAME` são escritos automaticamente
-pelo Terraform — nada a fazer. `DATABASE_PASSWORD` nunca fica no SSM: vive no segredo gerenciado
-pelo RDS no Secrets Manager, referenciado pelo parâmetro `DATABASE_PASSWORD_SECRET_ARN`.
-
-### Segredos e variáveis do GitHub Actions
-
-| Nome | Tipo | Descrição |
-|---|---|---|
-| `AWS_ROLE_ARN` | Secret do repositório | ARN da role OIDC de deploy (output `deploy_role_arn` do Terraform) |
-| `AWS_REGION` | Variável do repositório | Região AWS, deve coincidir com `aws_region` do Terraform |
-| `TF_API_TOKEN` | Secret do repositório | Token de time da HCP Terraform, usado pelo workflow `infra.yml` |
-| `TF_CLOUD_ORGANIZATION` | Variável do repositório | Organização na HCP Terraform |
-| `TF_WORKSPACE` | Variável do repositório | Nome do workspace (`vehicle-sales-infra`) |
-| `SONAR_TOKEN` | Secret do repositório | Token do SonarCloud (passo 9 do bootstrap); se ausente, os steps de análise são pulados sem quebrar a CI/CD |
-| `SONAR_PROJECT_KEY` / `SONAR_ORGANIZATION` | Variáveis do repositório | Identificação do projeto no SonarCloud (passo 9 do bootstrap) |
-| `APP_PUBLIC_IP` | Variável do repositório (opcional) | IP público (Elastic IP) usado no smoke test externo pós-deploy da CD |
 
 ## Referências
 

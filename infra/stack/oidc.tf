@@ -62,8 +62,8 @@ locals {
   # changes back. Both are exact strings under StringEquals (arrays are
   # evaluated as OR), so the trust boundary is unchanged — no wildcards.
   #
-  # Same owner id as vehicle-core-service, DIFFERENT repository id: var
-  # github_repository_id has no default on purpose (see variables.tf).
+  # Same owner id as vehicle-core-service, DIFFERENT repository id — both
+  # default to this repo's real values in variables.tf.
   github_subject_by_name = "repo:${local.github_repository}:ref:refs/heads/main"
   github_subject_by_id   = "repo:${var.github_org}@${var.github_owner_id}/${local.service_name}@${var.github_repository_id}:ref:refs/heads/main"
 }

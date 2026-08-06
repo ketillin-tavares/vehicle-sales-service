@@ -12,11 +12,6 @@ module "stack" {
   github_org       = "floci-local"
   aws_endpoint_url = "http://localhost:4566"
 
-  # Unused here (enable_github_oidc = false switches off everything that
-  # reads it), but the stack variable has no default on purpose — see
-  # infra/stack/variables.tf.
-  github_repository_id = "0"
-
   # Floci gap: it implements neither CreateOpenIDConnectProvider NOR
   # GetOpenIDConnectProvider, so the OIDC provider resource, the data source
   # that reads the shared provider, and the deploy role are ALL skipped

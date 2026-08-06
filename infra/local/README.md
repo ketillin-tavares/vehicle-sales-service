@@ -23,9 +23,8 @@ em relação a produção são variáveis do módulo:
   chamar `GetOpenIDConnectProvider`, que o Floci também não suporta. Ver o detalhamento das duas
   flags em [`infra/README.md`](../README.md#o-provider-oidc-é-um-recurso-compartilhado-e-o-core-é-dono-dele).
 - Backend **local** (sem `cloud {}`), state descartável — nunca é uma fonte de verdade.
-- `github_repository_id = "0"` — valor qualquer: a variável não tem default no módulo (ver
-  [`infra/README.md`](../README.md#github_repository_id-não-tem-default-de-propósito)), mas com
-  `enable_github_oidc = false` nada a lê de verdade nesta raiz.
+- `github_owner_id` / `github_repository_id` — não são passadas aqui: têm default no módulo e, com
+  `enable_github_oidc = false`, nada as lê nesta raiz.
 
 Tudo o mais (EC2, Security Groups, Elastic IP, RDS com senha gerenciada em Secrets Manager, ECR, IAM
 roles/instance profile incluindo a policy `Deny` do prefixo SSM do serviço par, KMS CMK, parâmetros
@@ -80,7 +79,7 @@ Não há `.env` nesta raiz: as credenciais fictícias são exportadas pelo próp
 | `github_org` | `floci-local` | organização/usuário real do GitHub (`github_org` do workspace) |
 | `aws_endpoint_url` | `http://localhost:4566` | `null` (usa a AWS real) |
 | `enable_github_oidc` | `false` | `true` (padrão) |
-| `github_repository_id` | `"0"` (não lido — `enable_github_oidc = false`) | id numérico real do repositório, sem default (workspace) |
+| `github_repository_id` | default do módulo (não lido — `enable_github_oidc = false`) | default do módulo: id numérico real do repositório |
 
 ## O Floci não valida autorização IAM
 

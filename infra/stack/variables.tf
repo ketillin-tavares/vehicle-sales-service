@@ -22,13 +22,16 @@ variable "github_owner_id" {
 variable "github_repository_id" {
   description = <<-EOT
     GitHub numeric immutable identifier of the vehicle-sales-service repository, used in the OIDC
-    `sub` claim (form `repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:...`). REPOSITORY-SPECIFIC and
-    DELIBERATELY WITHOUT A DEFAULT: a wrong id produces an opaque
-    `Not authorized to perform sts:AssumeRoleWithWebIdentity` at deploy time with nothing wrong in
-    the logs, so Terraform must refuse to plan until it is set explicitly. Find it at
-    https://api.github.com/repos/<owner>/vehicle-sales-service, field `id`.
+    `sub` claim (form `repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:...`). REPOSITORY-SPECIFIC: the
+    default below is THIS repository's id, read from
+    https://api.github.com/repos/<owner>/vehicle-sales-service (field `id`). Override only if the
+    repository is recreated or moved — the id is immutable across renames, which is the whole point
+    of the claim format. A WRONG id fails only at deploy time, as an opaque
+    `Not authorized to perform sts:AssumeRoleWithWebIdentity` with nothing wrong in the logs, so
+    never copy this value from another service's stack.
   EOT
   type        = string
+  default     = "1319407629"
 }
 
 variable "instance_type" {

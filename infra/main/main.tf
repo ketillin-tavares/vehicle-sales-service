@@ -24,8 +24,9 @@ variable "github_owner_id" {
 }
 
 variable "github_repository_id" {
-  description = "GitHub numeric immutable id of the vehicle-sales-service repository, used in the OIDC `sub` claim. REQUIRED — no default on purpose: a stale/borrowed id fails only at deploy time, as an opaque `Not authorized to perform sts:AssumeRoleWithWebIdentity`. Read the `id` field of https://api.github.com/repos/<owner>/vehicle-sales-service and set it as a workspace variable."
+  description = "GitHub numeric immutable id of the vehicle-sales-service repository, used in the OIDC `sub` claim. Defaults to THIS repository's id; override only if the repository is recreated or moved. A stale/borrowed id fails only at deploy time, as an opaque `Not authorized to perform sts:AssumeRoleWithWebIdentity` — never copy it from another service. See https://api.github.com/repos/<owner>/vehicle-sales-service, field `id`."
   type        = string
+  default     = "1319407629"
 }
 
 variable "aws_region" {
