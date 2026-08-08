@@ -57,6 +57,36 @@ class TestDomainErrorHandler:
         assert response.json() == {"detail": "erro de domínio simulado"}
 
 
+class TestOpenApiSchema:
+    """Tests for the OpenAPI schema exposure of internal-only routes."""
+
+    @pytest.mark.asyncio
+    async def test_internal_routes_are_hidden_from_openapi_schema(self, async_client: AsyncClient) -> None:
+        """Test that /internal/* routes are excluded from the public OpenAPI schema."""
+        # Arrange / Act
+        response = await async_client.get("/openapi.json")
+
+        # Assert
+        assert response.status_code == 200
+        paths = response.json()["paths"]
+        assert "/internal/v1/vehicles/{vehicle_id}" not in paths
+        assert not any(path.startswith("/internal/") for path in paths)
+
+    @pytest.mark.asyncio
+    async def test_public_routes_remain_documented(self, async_client: AsyncClient) -> None:
+        """Test that public routes, including the payment webhook consumed externally, stay in the schema."""
+        # Arrange / Act
+        response = await async_client.get("/openapi.json")
+
+        # Assert
+        assert response.status_code == 200
+        paths = response.json()["paths"]
+        assert "/v1/vehicles/for-sale" in paths
+        assert "/v1/vehicles/sold" in paths
+        assert "/v1/purchases" in paths
+        assert "/webhooks/v1/payments" in paths
+
+
 class TestInvalidCpfErrorHandler:
     """Tests for the InvalidCpfError -> HTTP 422 exception handler."""
 
